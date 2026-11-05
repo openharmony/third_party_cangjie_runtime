@@ -20,13 +20,9 @@ bool WCollector::IsUnmovableFromObject(BaseObject* obj) const
         return false;
     }
 
-    RegionInfo* regionInfo = nullptr;
-    if (RegionInfo::InGhostFromRegion(obj)) {
-        regionInfo = RegionInfo::GetGhostFromRegionAt(reinterpret_cast<uintptr_t>(obj));
-    } else {
-        regionInfo = RegionInfo::GetRegionInfoAt(reinterpret_cast<uintptr_t>(obj));
-    }
-    return regionInfo->IsUnmovableFromRegion();
+    // A ghost from region has been prepared (route established) and is pending forward,
+    // so its objects are movable via route. Non-ghost from-space objects are unmovable.
+    return !RegionInfo::InGhostFromRegion(obj);
 }
 
 bool WCollector::MarkObject(BaseObject* obj) const
@@ -146,7 +142,8 @@ void WCollector::EnumRefFieldRoot(RefField<>& field, RootSet& rootSet) const
         BaseObject* targetObj = oldField.GetTargetObject();
         latest = FindLatestVersion(targetObj);
     } else {
-        latest = field.GetTargetObject();
+        // Decode the same snapshot whose tag was checked above.
+        latest = oldField.GetTargetObject();
     }
 
     // target object could be null or non-heap for some static variable.
@@ -211,7 +208,8 @@ void WCollector::TraceRefField(BaseObject* obj, RefField<>& field, WorkStack& wo
         BaseObject* targetObj = oldField.GetTargetObject();
         latest = FindLatestVersion(targetObj);
     } else {
-        latest = field.GetTargetObject();
+        // Decode the same snapshot whose tag was checked above.
+        latest = oldField.GetTargetObject();
     }
 
     // target object could be null or non-heap for some static variable.
@@ -252,7 +250,8 @@ BaseObject* WCollector::GetAndTryTagObj(BaseObject* obj, RefField<>& field)
         BaseObject* targetObj = oldField.GetTargetObject();
         latest = FindLatestVersion(targetObj);
     } else {
-        latest = field.GetTargetObject();
+        // Decode the same snapshot whose tag was checked above.
+        latest = oldField.GetTargetObject();
     }
     // target object could be null or non-heap for some static variable.
     if (!Heap::IsHeapAddress(latest)) {

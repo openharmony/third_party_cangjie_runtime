@@ -8,6 +8,8 @@
 
 
 #include "TypeInfoManager.h"
+#include <new> // placement new (std::operator new(size_t, void*))
+
 #include "Base/CString.h"
 #include "Base/MemUtils.h"
 #include "ObjectModel/MClass.h"
@@ -151,7 +153,10 @@ void TypeInfoManager::Fini()
 {
     // release resources
     for (const auto& mTable : mTableList) {
-        delete mTable.second;
+        // MTableDesc lives in the arena (see AllocateMTableDesc), so it is destroyed in place
+        // instead of deleted: this releases what its members own (e.g. the mTable hash map)
+        // while the arena is still mapped.
+        mTable.second->~MTableDesc();
     }
     mTableList.clear();
     for (const auto& m : mmapList) {
@@ -317,8 +322,10 @@ TypeInfoManager::GenericTiDesc* TypeInfoManager::GenericTiDescHashMap::GetGeneri
     if (it != bucket.maps.end()) {
         for (auto descIt = it->second.begin(); descIt != it->second.end(); ++descIt) {
             if (**descIt == desc) {
+                // Copy under the lock: the vector may be reallocated after unlock (UAF).
+                GenericTiDesc* result = *descIt;
                 bucket.rwLock.UnlockRead();
-                return *descIt;
+                return result;
             }
         }
     }
@@ -336,8 +343,10 @@ TypeInfoManager::GenericTiDesc* TypeInfoManager::GenericTiDescHashMap::InsertGen
     if (it != bucket.maps.end()) {
         for (auto descIt = it->second.begin(); descIt != it->second.end(); ++descIt) {
             if (**descIt == desc) {
+                // Same as GetGenericTiDesc: copy under the lock to avoid UAF.
+                GenericTiDesc* result = *descIt;
                 bucket.rwLock.UnlockWrite();
-                return *descIt;
+                return result;
             }
         }
     }
@@ -560,20 +569,7 @@ bool TypeInfoManager::IsEnumInfoReady(TypeTemplate* tt, TypeInfo* ti)
     if (ti->GetEnumInfo() != nullptr && ti->GetEnumInfo()->IsParsed()) {
         return true;
     }
-    if (tt->IsEnumCtor() && ti->GetReflectInfo() != nullptr) {
-        return true;
-    }
     return false;
-}
-
-void TypeInfoManager::HandleEnumCtorReflectInfo(TypeTemplate* tt, TypeInfo* ti)
-{
-    EnumCtorReflectInfo* ttEnumCtorInfo = tt->GetEnumCtorReflectInfo();
-    EnumCtorReflectInfo* enumCtorInfo =
-        reinterpret_cast<EnumCtorReflectInfo*>(Allocate(sizeof(EnumCtorReflectInfo)));
-    MapleRuntime::MemoryCopy(reinterpret_cast<Uptr>(enumCtorInfo), sizeof(EnumCtorReflectInfo),
-        reinterpret_cast<uintptr_t>(ttEnumCtorInfo), sizeof(EnumCtorReflectInfo));
-    ti->SetEnumCtorReflectInfo(enumCtorInfo);
 }
 
 EnumInfo* TypeInfoManager::AllocateEnumInfo(EnumInfo* ttEnumInfo)
@@ -581,6 +577,12 @@ EnumInfo* TypeInfoManager::AllocateEnumInfo(EnumInfo* ttEnumInfo)
     size_t enumInfoSize = sizeof(EnumInfo);
     enumInfoSize += ttEnumInfo->GetNumOfInstanceMethodInfos() * sizeof(DataRefOffset64<MethodInfo>);
     enumInfoSize += ttEnumInfo->GetNumOfStaticMethodInfos() * sizeof(DataRefOffset64<MethodInfo>);
+    // In early versions of enumInfo, there was no enum constructor's annotations field.
+    // To ensure compatibility, enum constructor's annotations are processed only when
+    // the reflect version is >= 2.
+    if (ttEnumInfo->GetReflectVersion() >= 2) {
+        enumInfoSize += ttEnumInfo->GetNumOfEnumCtor() * sizeof(Uptr);
+    }
     uintptr_t enumInfoAddr = Allocate(enumInfoSize);
     MapleRuntime::MemoryCopy(enumInfoAddr, enumInfoSize,
         reinterpret_cast<uintptr_t>(ttEnumInfo), enumInfoSize);
@@ -643,11 +645,7 @@ void TypeInfoManager::ParseEnumInfo(TypeTemplate* tt, U32 argSize, TypeInfo* arg
     return;
 #endif
     EnumInfo* ttEnumInfo = tt->GetEnumInfo();
-    if (ttEnumInfo == nullptr || IsEnumInfoReady(tt, ti)) {
-        return;
-    }
-    if (tt->IsEnumCtor() && ti->GetReflectInfo() == nullptr) {
-        HandleEnumCtorReflectInfo(tt, ti);
+    if (ttEnumInfo == nullptr || IsEnumInfoReady(tt, ti) || tt->IsEnumCtor()) {
         return;
     }
     if (!tt->ReflectIsEnable()) {
@@ -923,5 +921,24 @@ uintptr_t TypeInfoManager::Allocate(size_t size)
         addr = position.fetch_add(size);
     }
     return addr;
+}
+
+MTableDesc* TypeInfoManager::AllocateMTableDesc(ArchUInt bitmap)
+{
+    // MTableDesc is built in the TypeInfoManager arena instead of the C++ heap: heap pointers
+    // are tagged by HWASan/TBI on some targets, and a tagged MTableDesc* can carry 0x80 in the
+    // top byte, which is exactly the marker of the compiler's inline short bitmap kept in
+    // TypeInfo::mTableDesc. Arena memory is never tagged, so a real pointer keeps a clear top
+    // byte and is always distinguishable from a bitmap. The object is kept alive via mTableList
+    // and destroyed in place by Fini(), so it must not be deleted.
+    constexpr size_t descAlign = alignof(MTableDesc);
+    // Allocate() just bumps the arena cursor and does no alignment, so reserve the worst-case
+    // padding and round the block start up here. It aborts instead of returning null.
+    uintptr_t addr = MRT_ALIGN(Allocate(sizeof(MTableDesc) + descAlign - 1), descAlign);
+    // Placement new does not allocate memory here: it invokes MTableDesc's constructor at
+    // the already allocated arena address. The returned pointer therefore remains an arena
+    // pointer, rather than a new C++ heap pointer that HWASan/TBI could tag. Do not replace
+    // this with `new (std::nothrow) MTableDesc(bitmap)`, which would reintroduce the conflict.
+    return new (reinterpret_cast<void*>(addr)) MTableDesc(bitmap);
 }
 } // namespace MapleRuntime

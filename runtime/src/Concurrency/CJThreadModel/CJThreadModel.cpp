@@ -83,14 +83,17 @@ static void RegisterCJThreadHooks()
 
 static bool GetStackGuardFlagEnv()
 {
-    const char* env = std::getenv("MRT_STACK_CHECK");
-    if (env != nullptr) {
-        if (CString::ParseFlagFromEnv(env)) {
-            return true;
+    static const bool stackGuardCheck = []() {
+        const char* env = std::getenv("MRT_STACK_CHECK");
+        if (env != nullptr) {
+            if (CString::ParseFlagFromEnv(env)) {
+                return true;
+            }
+            LOG(RTLOG_ERROR, "unsupported MRT_STACK_CHECK. Should set variable to 1 or true or TRUE\n");
         }
-        LOG(RTLOG_ERROR, "unsupported MRT_STACK_CHECK. Should set variable to 1 or true or TRUE\n");
-    }
-    return false;
+        return false;
+    }();
+    return stackGuardCheck;
 }
 
 // ConcurrencyParam.processorNum set the processor number of scheduler, it is set as following ways:
@@ -100,17 +103,8 @@ static bool GetStackGuardFlagEnv()
 void CJThreadModel::Init(const ConcurrencyParam param, ScheduleType scheduleType)
 {
     ScheduleAttr attr;
-    ScheduleAttrInit(&attr);
-    ScheduleAttrThstackSizeSet(&attr, param.thStackSize * KB);
-    ScheduleAttrCostackSizeSet(&attr, param.coStackSize * KB);
-    ScheduleAttrProcessorNumSet(&attr, param.processorNum);
     stackGuardCheck = GetStackGuardFlagEnv();
-    if (stackGuardCheck) {
-        ScheduleAttrStackProtectSet(&attr, true);
-    }
-    if (scheduleType == SCHEDULE_UI_THREAD) {
-        ScheduleAttrStackGrowSet(&attr, false);
-    }
+    ScheduleAttrInitWithParams(&attr, param, stackGuardCheck, scheduleType != SCHEDULE_UI_THREAD);
 
     ScheduleGetTlsHookRegister((GetTlsHookFunc)MRT_GetThreadLocalData);
 
